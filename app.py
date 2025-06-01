@@ -37,41 +37,45 @@ Enter a public GitHub repository URL to fetch its text-based file contents and c
 suitable for input into Large Language Models. Provide optional glob patterns for fine-grained control over included/excluded files.
 """)
 
-repo_url = st.text_input("GitHub Repository URL:", placeholder="e.g., https://github.com/streamlit/streamlit")
-github_pat = st.text_input("Optional: GitHub Personal Access Token (PAT)", type="password", help="PAT increases API rate limits. Use a token with 'repo' scope if accessing private repos (not recommended for public app).")
+# --- Sidebar Inputs ---
+st.sidebar.header("⚙️ Settings")
 
-st.subheader("Custom File Filtering (Glob Patterns)")
-col_glob1, col_glob2 = st.columns(2)
+st.sidebar.subheader("Repository Information")
+repo_url = st.sidebar.text_input("GitHub Repository URL:", placeholder="e.g., https://github.com/streamlit/streamlit")
+github_pat = st.sidebar.text_input("Optional: GitHub PAT", type="password", help="PAT increases API rate limits. Use with 'repo' scope for private repos.")
+
+st.sidebar.subheader("Custom File Filtering")
+col_glob1, col_glob2 = st.sidebar.columns(2)
 with col_glob1:
-    include_patterns_input = st.text_area(
-        "Inclusion Glob Patterns (per line):",
+    include_patterns_input = st.sidebar.text_area(
+        "Inclusion Globs (per line):",
         placeholder="e.g.,\nsrc/**/*.py\n*.md\n!**/test_*.py",
-        help="Files matching these patterns will be included. If empty, all files passing other filters are included. Supports standard .gitignore glob syntax. `!` prefix negates a pattern within inclusions."
+        help="Files matching these patterns will be included. Supports .gitignore glob syntax. `!` prefix negates."
     )
 with col_glob2:
-    exclude_patterns_input = st.text_area(
-        "Exclusion Glob Patterns (per line):",
+    exclude_patterns_input = st.sidebar.text_area(
+        "Exclusion Globs (per line):",
         placeholder="e.g.,\n*.log\ntemp/\n**/*.tmp\n!important.log",
-        help="Files or directories matching these patterns will be excluded. Supports standard .gitignore glob syntax. `!` prefix negates a pattern, meaning it *won't* be excluded by other rules in this list."
+        help="Files matching these patterns will be excluded. Supports .gitignore glob syntax. `!` prefix negates."
     )
 
-st.subheader("Content Size Management")
-col_size1, col_size2 = st.columns(2)
+st.sidebar.subheader("Content Size Management")
+col_size1, col_size2 = st.sidebar.columns(2)
 with col_size1:
-    max_file_size_kb = st.number_input(
-        "Max Individual File Size (KB):",
+    max_file_size_kb = st.sidebar.number_input(
+        "Max File Size (KB):",
         min_value=0,
         value=1024,  # Default 1MB
         step=128,
-        help="Files larger than this size (in kilobytes) will be skipped. 0 means no limit."
+        help="Files larger than this (KB) are skipped. 0 for no limit."
     )
 with col_size2:
-    total_output_threshold_mb = st.number_input(
-        "Total Output Size Warning Threshold (MB):",
+    total_output_threshold_mb = st.sidebar.number_input(
+        "Total Output Threshold (MB):",
         min_value=0,
         value=5,  # Default 5MB
         step=1,
-        help="A warning will be displayed if the total generated Markdown size exceeds this limit (in megabytes)."
+        help="Warn if total Markdown exceeds this (MB)."
     )
 
 def get_repo_api_url(repo_url):
@@ -321,7 +325,7 @@ def fetch_repo_contents(repo_url):
     return repo_files_content
 
 
-if st.button("Convert to Markdown", key="convert_button"):
+if st.sidebar.button("Convert to Markdown", key="convert_button"):
     if not repo_url: # Check if repo_url is empty before proceeding
         st.error("Please enter a GitHub repository URL.")
         st.stop()
