@@ -10,6 +10,13 @@ except ImportError:
     st.error("The 'pathspec' library is not installed. Please install it by running: pip install pathspec")
     st.stop()
 import base64
+try:
+    import streamlit_antd_components as sac
+except ImportError:
+    st.error("The 'streamlit-antd-components' library is not installed. Please install it by running: pip install streamlit-antd-components")
+    # No st.stop() here, will try to provide a fallback later if sac is None or tree display fails
+    sac = None
+
 
 # Common non-text file extensions to ignore
 IGNORED_EXTENSIONS = [
@@ -78,6 +85,32 @@ with col_size2:
         help="Warn if total Markdown exceeds this (MB)."
     )
 
+st.sidebar.subheader("Output Options")
+st.sidebar.checkbox("Include repository map at the top of Markdown", key="repo_map_option", value=False)
+
+# --- Cache Clear Button ---
+if st.sidebar.button("Clear Cache & Re-fetch", key="clear_cache_button"):
+    st.cache_data.clear()
+    st.success("Cache cleared! Click 'Convert to Markdown' again to re-fetch with latest data.")
+    # Optionally, could trigger a re-run if complex state management is involved,
+    # but for now, user can click the main button again.
+
+# --- Cached API Call Functions ---
+@st.cache_data(show_spinner=False) # Disable spinner for individual cached calls; main spinner is in fetch_repo_contents
+def cached_requests_get(url, headers):
+    """Wraps requests.get for caching.
+    We want the cache to depend on url and headers (especially PAT).
+    """
+    try:
+        response = requests.get(url, headers=headers)
+        response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
+        return response
+    except requests.exceptions.RequestException as e:
+        # Instead of st.error here, which might be too disruptive for a cached function,
+        # let the caller handle it or return a specific error object.
+        # For now, re-raise to be handled by the caller.
+        raise
+
 def get_repo_api_url(repo_url):
     # Example: https://github.com/owner/repo -> https://api.github.com/repos/owner/repo
     if not repo_url.startswith("https://github.com/"):
@@ -100,8 +133,9 @@ def fetch_repo_contents(repo_url):
     if github_pat:
         headers["Authorization"] = f"token {github_pat}"
 
-    repo_files_content = {}
-    processed_paths = set()
+    # repo_files_content = {} # This will be populated later by a different function
+    all_repo_paths = [] # Stores list of dicts: {'path': str, 'type': 'file'/'dir', 'name': str, 'sha': str}
+    processed_paths_for_recursion = set() # Used by the recursive path fetching function
 
     # Parse user-defined glob patterns
     include_spec = None
@@ -126,67 +160,78 @@ def fetch_repo_contents(repo_url):
     gitignore_spec = None
     try:
         gitignore_url = f"{api_url}/contents/.gitignore"
-        # ... (rest of .gitignore fetching logic remains the same) ...
-        response = requests.get(gitignore_url, headers=headers)
-        if response.status_code == 200:
-            gitignore_data = response.json()
-            if gitignore_data.get('encoding') == 'base64' and gitignore_data.get('content'):
-                gitignore_content = base64.b64decode(gitignore_data['content']).decode('utf-8', errors='replace')
-                standard_ignores = ["*.pyc", "*.pyo", "*.pyd", "__pycache__/", ".DS_Store"] # Keep these minimal as .gitignore is primary
-                gitignore_lines = gitignore_content.splitlines() # Do not add standard_ignores here if they should be overridable by user patterns
-                gitignore_spec = pathspec.PathSpec.from_lines('gitwildmatch', gitignore_lines)
-                st.info("Successfully fetched and parsed .gitignore rules.")
-            elif gitignore_data.get('download_url'): # Try download_url if content not directly available
-                gitignore_content_resp = requests.get(gitignore_data['download_url'], headers=headers)
-                gitignore_content_resp.raise_for_status()
-                gitignore_content = gitignore_content_resp.text
-                gitignore_spec = pathspec.PathSpec.from_lines('gitwildmatch', gitignore_content.splitlines())
-                st.info("Successfully fetched and parsed .gitignore rules from download_url.")
-            else:
-                st.warning(".gitignore found but content is not in expected format or no download_url.")
-        elif response.status_code == 404:
+        # Use cached request for .gitignore
+        response = cached_requests_get(gitignore_url, headers)
+        # Since cached_requests_get now raises for status, we don't need to check response.status_code == 200 here
+        gitignore_data = response.json() # If no error, proceed
+        if gitignore_data.get('encoding') == 'base64' and gitignore_data.get('content'):
+            gitignore_content = base64.b64decode(gitignore_data['content']).decode('utf-8', errors='replace')
+            # standard_ignores = ["*.pyc", "*.pyo", "*.pyd", "__pycache__/", ".DS_Store"] # Keep these minimal
+            gitignore_lines = gitignore_content.splitlines()
+            gitignore_spec = pathspec.PathSpec.from_lines('gitwildmatch', gitignore_lines)
+            st.info("Successfully fetched and parsed .gitignore rules.")
+        elif gitignore_data.get('download_url'): # Try download_url if content not directly available
+            # Use cached request for download_url content
+            gitignore_content_resp = cached_requests_get(gitignore_data['download_url'], headers)
+            gitignore_content = gitignore_content_resp.text
+            gitignore_spec = pathspec.PathSpec.from_lines('gitwildmatch', gitignore_content.splitlines())
+            st.info("Successfully fetched and parsed .gitignore rules from download_url.")
+        else:
+            st.warning(".gitignore found but content is not in expected format or no download_url.")
+    # Handle specific exceptions from cached_requests_get or general ones
+    except requests.exceptions.HTTPError as e:
+        if e.response.status_code == 404:
             st.info(".gitignore not found in the repository root.")
         else:
-            st.warning(f"Failed to fetch .gitignore: {response.status_code} - {response.text}")
+            st.warning(f"Failed to fetch .gitignore: {e.response.status_code} - {e.response.text}")
     except requests.exceptions.RequestException as e:
         st.warning(f"Error fetching .gitignore: {e}")
-    except Exception as e:
+    except Exception as e: # Catch other potential errors during .gitignore processing
         st.error(f"Error processing .gitignore: {e}")
 
+    # Renamed and refactored function to only fetch paths and types
+    def _fetch_repo_paths_recursive(current_api_path=""):
+        # current_api_path is the path used for API calls, e.g., "src/components"
+        # relative_path_for_specs is the path used for matching against .gitignore, user globs, etc.
+        # It should be relative to the repo root and not have a leading "./"
 
-    def _get_files_recursive(path=""):
-        if path in processed_paths:
+        # Memoization: if we've processed this API path, skip.
+        if current_api_path in processed_paths_for_recursion:
             return
-        processed_paths.add(path)
+        processed_paths_for_recursion.add(current_api_path)
 
-        relative_path_for_specs = path.lstrip('./') # Used for all pathspec matching
+        relative_path_for_specs = current_api_path.lstrip('./')
 
-        # Rule a: Always ignore .git directory (path component check)
+        # Rule a: Always ignore .git directory (path component check) - applies to current_api_path as a whole
         if '/.git/' in f'/{relative_path_for_specs}/' or relative_path_for_specs.startswith('.git/'):
-            st.info(f"Ignoring (dot git dir): {path}")
+            st.info(f"Ignoring (dot git dir path): {current_api_path}")
             return
 
-        # Rule b: IGNORED_EXTENSIONS and hardcoded directory names (primary for binaries and common unwanted folders)
-        # This check is on individual item['name'] later, but for directories, we can check the path here.
-        # For directories, this mainly applies to names like 'node_modules', 'venv' if the path itself matches.
-        # Files are checked later.
+        # Rule b: Hardcoded ignored directory names (applies to current_api_path as a whole)
         hardcoded_ignored_dir_names = ['node_modules', 'venv', '__pycache__', 'dist', 'build', '.vscode', '.idea']
-        if any(f'/{ignored_name}/' in f'/{relative_path_for_specs}/' for ignored_name in hardcoded_ignored_dir_names) or \
-           relative_path_for_specs in hardcoded_ignored_dir_names:
-            # Check if any part of the path is a hardcoded ignored directory name
-            # or if the path itself is one of these names (for root level ignored dirs)
-            st.info(f"Ignoring (hardcoded dir name in path): {path}")
+        # Check if any component of the current_api_path is a hardcoded ignored directory name
+        path_components = set(relative_path_for_specs.split('/'))
+        if any(ignored_name in path_components for ignored_name in hardcoded_ignored_dir_names):
+            # More precise check: if current_api_path itself is 'node_modules' or 'src/node_modules' etc.
+            is_hardcoded_ignored_path = False
+            temp_path = relative_path_for_specs
+            for part in temp_path.split('/'):
+                if part in hardcoded_ignored_dir_names:
+                    is_hardcoded_ignored_path = True
+                    break
+            if is_hardcoded_ignored_path:
+                st.info(f"Ignoring (hardcoded ignored directory in path): {current_api_path}")
+                return
+
+        # Rule c: .gitignore rules (applies to current_api_path if it's a directory being considered for traversal)
+        # If current_api_path itself is matched by .gitignore, we don't traverse it.
+        if gitignore_spec and gitignore_spec.match_file(relative_path_for_specs) and relative_path_for_specs: # Non-empty path
+            st.info(f"Ignoring (directory matched by .gitignore): {current_api_path}")
             return
 
-
-        # Rule c: .gitignore rules
-        if gitignore_spec and gitignore_spec.match_file(relative_path_for_specs):
-            st.info(f"Ignoring ('.gitignore'): {path}")
-            return
-
-        # Rule d: User-defined EXCLUSION glob patterns
-        if exclude_spec and exclude_spec.match_file(relative_path_for_specs):
-            st.info(f"Ignoring (user exclusion pattern): {path}")
+        # Rule d: User-defined EXCLUSION glob patterns (applies to current_api_path for directory traversal)
+        if exclude_spec and exclude_spec.match_file(relative_path_for_specs) and relative_path_for_specs: # Non-empty path
+            st.info(f"Ignoring (directory matched by user exclusion): {current_api_path}")
             return
 
         # Rule e: User-defined INCLUSION glob patterns (applies to files and affects directory traversal)
@@ -203,124 +248,374 @@ def fetch_repo_contents(repo_url):
         # itself does not match any include pattern (e.g. 'src/' for a pattern like 'src/**'), then we might
         # be tempted to prune it. But we shouldn't if the pattern is 'src/sub/file.py'.
         # So, the inclusion check for directories is effectively "don't prune yet, check files inside".
-        # The file-level inclusion check is definitive.
+        # The file-level inclusion check is definitive for files.
+        # For directories, if include_patterns exist, we traverse if the dir *might* contain included files.
+        # This means a dir not matching an include pattern (e.g. 'docs/') when pattern is 'src/**/*.py'
+        # should still be traversed if it's not explicitly excluded.
+        # The definitive file filtering happens when an item is identified as a file.
 
-        current_url = f"{contents_url}/{path}"
+        api_call_url = f"{contents_url}/{current_api_path}"
         try:
-            response = requests.get(current_url, headers=headers)
-            response.raise_for_status() # Raise an exception for HTTP errors
+            response = cached_requests_get(api_call_url, headers)
             items = response.json()
-
-            # Sort items to process files before directories (optional, but can be cleaner)
-            items.sort(key=lambda x: x['type'], reverse=True)
+            items.sort(key=lambda x: x['type'], reverse=True) # Process files first or dirs first? Dirs for deeper traversal.
 
             for item in items:
-                # Construct item_path carefully to avoid leading/double slashes
-                if not path or path.endswith("/"):
-                    item_path = f"{path}{item['name']}"
+                # item_api_path is the full path for the next API call if it's a dir, or the full path of the file.
+                if not current_api_path or current_api_path.endswith("/"):
+                    item_api_path = f"{current_api_path}{item['name']}"
                 else:
-                    item_path = f"{path}/{item['name']}"
+                    item_api_path = f"{current_api_path}/{item['name']}"
 
-                if item['type'] == 'file':
-                    relative_item_path = item_path.lstrip('./') # Path relative to repo root
+                item_relative_path_for_specs = item_api_path.lstrip('./')
 
-                    # Rule a: Always ignore .git directory (name check - defensive)
-                    if item['name'] == '.git':
-                        st.info(f"Ignoring (item name is .git): {item_path}")
-                        continue
+                # --- Apply filtering rules to each item ---
+                # Rule a.1: .git directory by name (defensive, path check should catch it)
+                if item['name'] == '.git':
+                    st.info(f"Ignoring (item name .git): {item_api_path}")
+                    continue
 
-                    # Rule b: IGNORED_EXTENSIONS (for files) and hardcoded dir name for items inside path
-                    # Check if item's name itself is a hardcoded ignored directory (e.g. path is 'src', item['name'] is 'node_modules')
-                    if item['type'] == 'dir' and item['name'] in hardcoded_ignored_dir_names:
-                        st.info(f"Ignoring (hardcoded item name): {item_path}")
-                        continue
-                    if item['type'] == 'file' and any(item['name'].lower().endswith(ext) for ext in IGNORED_EXTENSIONS):
-                        st.info(f"Ignoring (extension): {item_path}")
-                        continue
+                # Rule b.1: Hardcoded ignored item names (e.g. if item['name'] is 'node_modules')
+                # This is mostly for directories. Files are by extension.
+                if item['type'] == 'dir' and item['name'] in hardcoded_ignored_dir_names:
+                    st.info(f"Ignoring (hardcoded item name): {item_api_path}")
+                    continue
 
-                    # Rule c: .gitignore rules (applied again here for items, path was checked before recursion)
-                    if gitignore_spec and gitignore_spec.match_file(relative_item_path):
-                        st.info(f"Ignoring ('.gitignore'): {item_path}")
-                        continue
+                # Rule for files: IGNORED_EXTENSIONS
+                if item['type'] == 'file' and any(item['name'].lower().endswith(ext) for ext in IGNORED_EXTENSIONS):
+                    st.info(f"Ignoring (file extension): {item_api_path}")
+                    continue
 
-                    # Rule d: User-defined EXCLUSION glob patterns
-                    if exclude_spec and exclude_spec.match_file(relative_item_path):
-                        st.info(f"Ignoring (user exclusion): {item_path}")
-                        continue
+                # Rule c.1: .gitignore (applied to each specific item path)
+                if gitignore_spec and gitignore_spec.match_file(item_relative_path_for_specs):
+                    st.info(f"Ignoring (item matched by .gitignore): {item_api_path}")
+                    continue
 
-                    # Rule e: User-defined INCLUSION glob patterns (applies definitively to files)
-                    if include_spec and not include_spec.match_file(relative_item_path):
-                        st.info(f"Ignoring (not in user inclusion): {item_path}")
-                        continue
+                # Rule d.1: User-defined EXCLUSION glob patterns (applied to each specific item path)
+                if exclude_spec and exclude_spec.match_file(item_relative_path_for_specs):
+                    st.info(f"Ignoring (item matched by user exclusion): {item_api_path}")
+                    continue
 
-                    # Max File Size Check (before download attempt)
-                    # User input is in KB, item['size'] is in bytes. max_file_size_kb = 0 means no limit.
-                    if max_file_size_kb > 0 and item.get('size', 0) > (max_file_size_kb * 1024):
-                        st.warning(f"Skipping '{item_path}' (size: {item.get('size', 0)/1024:.2f} KB) as it exceeds the {max_file_size_kb} KB limit.")
-                        continue
+                # Rule e.1: User-defined INCLUSION glob patterns (applies definitively to files)
+                # For directories, if include_spec is active, we only recurse if the directory *could* contain included files.
+                # This means if a directory itself doesn't match an include pattern, but its sub-path could, we still go in.
+                # Example: include_spec = "src/utils/*.py". Current item_api_path = "src". We should recurse.
+                # If item_api_path = "docs" and type is dir, we might not recurse if "docs" itself doesn't match any part of include_spec.
+                # This is complex without full tree matching. A simpler rule: if include_spec exists,
+                # a file must match it. A directory is traversed if it's not excluded.
+                if item['type'] == 'file' and include_spec and not include_spec.match_file(item_relative_path_for_specs):
+                    st.info(f"Ignoring (file not in user inclusion): {item_api_path}")
+                    continue
 
-                    # If we reach here, the file is included and within size limits.
-                    download_url = item.get('download_url')
-                    if download_url:
-                        try:
-                            # Make sure to pass headers (e.g. for PAT on private repos for download_url)
-                            file_response = requests.get(download_url, headers=headers)
-                            file_response.raise_for_status() # Check for download errors
-                            # Try decoding with UTF-8, then latin-1, then give up for this file
-                            try:
-                                content = file_response.content.decode('utf-8')
-                            except UnicodeDecodeError:
-                                try:
-                                    content = file_response.content.decode('latin-1')
-                                except UnicodeDecodeError:
-                                    st.warning(f"Could not decode file {item_path} with UTF-8 or Latin-1. Skipping.")
-                                    continue # Skip this file
-                            repo_files_content[item_path] = content
-                            st.success(f"Fetched: {item_path}")
-                        except requests.exceptions.RequestException as e_file:
-                            st.warning(f"Error downloading file {item_path}: {e_file}. Skipping.")
-                            # repo_files_content[item_path] = f"Error downloading file: {e_file}" # Don't add error as content
-                    else:
-                        st.info(f"Skipping {item_path} (no download URL, possibly a submodule, symlink or too large).")
+                # Max File Size Check (only for files, and only if we were to download content, here just for info)
+                if item['type'] == 'file' and max_file_size_kb > 0 and item.get('size', 0) > (max_file_size_kb * 1024):
+                    st.warning(f"Skipping path (file size limit): {item_api_path} (size: {item.get('size',0)/1024:.2f}KB)")
+                    continue # Don't even add its path if it's too large
 
-                elif item['type'] == 'dir': # For directories, we decide whether to recurse
-                    # The path-level checks at the start of _get_files_recursive handle most directory exclusions.
-                    # If we are here, the directory 'path' itself wasn't ignored by those top-level checks.
-                    # Now we check the specific 'item' (which is a directory).
-                    # If include_spec is active, we should only recurse if this directory *could* contain included files.
-                    # This is where match_tree_files from pathspec would be ideal.
-                    # A simpler heuristic: if include_spec exists and the dir itself doesn't match, AND no files inside it could match, then prune.
-                    # For now, let's assume if a directory isn't EXCLUDED, we should look inside it,
-                    # and the file-level inclusion patterns will filter the files found.
-                    # This means we might traverse more than necessary if specific include patterns are like `src/a/b/file.py`
-                    # but it's safer than pruning too aggressively without `match_tree_files`.
-                    _get_files_recursive(item_path)
+                # If all checks pass, add the item's path and type
+                path_info = {
+                    "path": item_api_path, # Full path from repo root
+                    "type": item['type'],   # 'file' or 'dir'
+                    "name": item['name'],
+                    "sha": item.get('sha') # Useful for tree key or future operations
+                }
+                all_repo_paths.append(path_info)
+                # st.success(f"Path added: {item_api_path} (type: {item['type']})")
+
+
+                if item['type'] == 'dir':
+                    # Recurse into subdirectories that haven't been filtered out by path-level or item-level checks
+                    _fetch_repo_paths_recursive(item_api_path)
 
                 elif item['type'] == 'symlink':
-                    st.info(f"Ignoring (symlink): {item_path}")
+                    st.info(f"Ignoring (symlink): {item_api_path}")
+                    # Optionally, could try to resolve symlinks if necessary, but GitHub API might not directly support it for contents
 
         except requests.exceptions.HTTPError as e:
-            # Handle 404 for path not found within the repo (e.g. a path component was a file)
-            if e.response.status_code == 404 and path: # only if path is not empty (root check is done before)
-                st.warning(f"Path component of '{path}' not found or is a file, cannot list contents. Skipping this path.")
-                return # Stop recursion for this path
-            if e.response.status_code == 404:
-                st.error(f"Repository or path not found: {current_url}. If it's a private repository, a PAT with 'repo' scope is required.")
+            if e.response.status_code == 404 and current_api_path:
+                st.warning(f"Path '{current_api_path}' not found or is a file; cannot list contents. Skipping.")
+                return
+            if e.response.status_code == 404: # Root path not found
+                 st.error(f"Repository or root path not found: {api_call_url}. Private repo? PAT with 'repo' scope needed.")
             elif e.response.status_code == 403:
-                st.error(f"Access forbidden for {current_url}. This could be due to API rate limits or insufficient permissions. Try adding a GitHub PAT.")
-                st.error(f"Rate limit info: {e.response.headers.get('X-RateLimit-Remaining')}/{e.response.headers.get('X-RateLimit-Limit')}")
+                st.error(f"Access forbidden for {api_call_url}. Rate limit or insufficient permissions. PAT may help.")
+                st.error(f"Rate limit: {e.response.headers.get('X-RateLimit-Remaining')}/{e.response.headers.get('X-RateLimit-Limit')}")
             else:
-                st.error(f"Error fetching repository structure from {current_url}: {e}")
-        except requests.exceptions.RequestException as e: # Catch other request errors (network, timeout)
-            st.error(f"Network error while fetching {current_url}: {e}")
-        # Do not clear repo_files_content here, might have partial data
+                st.error(f"Error fetching structure from {api_call_url}: {e}")
+        except requests.exceptions.RequestException as e:
+            st.error(f"Network error for {api_call_url}: {e}")
+        except Exception as e:
+            st.error(f"Unexpected error processing path '{current_api_path}': {e}")
 
-    with st.spinner("Fetching repository contents... This may take a while for large repositories."):
-        _get_files_recursive()
+    # Initial call to start fetching all paths
+    with st.spinner("Fetching repository file and directory paths..."):
+        _fetch_repo_paths_recursive() # Start with empty path for repo root
 
-    if not repo_files_content and get_repo_api_url(repo_url):
-        st.warning("No text files found that match the criteria, or the repository is empty/inaccessible with current settings.")
-        return {}
+    if not all_repo_paths and get_repo_api_url(repo_url): # Check if repo_url itself is valid
+        st.warning("No files or directories found that match criteria, or repo is empty/inaccessible.")
+        return [] # Return empty list if nothing found or error occurred that prevented path collection
+
+    # For now, just return the flat list of paths. Tree building will be separate.
+    # st.write("Fetched paths:", all_repo_paths) # For debugging
+    return all_repo_paths
+
+def get_effective_selected_files(tree_nodes_data, selected_node_ids):
+    """
+    Traverses the SAC tree data and compiles a list of file paths to fetch based on selected node IDs.
+    If a directory is selected, all files within it (that were part of the original path fetching) are included.
+    """
+    files_to_fetch = set() # Use a set to avoid duplicate paths
+
+    # Helper recursive function to traverse the tree
+    def traverse_and_collect(nodes, current_path_prefix=""):
+        for node in nodes:
+            node_id = node['id'] # 'id' in sac.tree maps to 'key' from our internal tree ('sha' or full path)
+            node_path = node['path'] # The full path to the item, stored during tree conversion
+
+            # Check if the node itself or any of its parents were selected.
+            # For simplicity in this step, we'll assume sac.tree returns all individually checked items.
+            # If a parent dir is checked, sac.tree might return only the parent, or parent + all children
+            # depending on its configuration. We assume `selected_node_ids` contains all items that should
+            # be considered "checked", whether directly or by parent selection.
+            # The `sac.tree` with `return_checked=True` should ideally give us a list of all explicitly
+            # and implicitly checked items. Let's work with that assumption.
+
+            if node_id in selected_node_ids:
+                if node['icon'] == 'file-text': # Check based on icon, assuming it maps to file type
+                    files_to_fetch.add(node_path)
+                elif node['icon'] == 'folder' and node.get('children'):
+                    # If a folder is selected, recursively add all files from its children
+                    # The children here are already part of the filtered tree.
+                    collect_all_files_from_subtree(node['children'])
+
+            # Even if a parent isn't explicitly in selected_node_ids, its children might be.
+            # This is important if sac.tree only returns explicitly checked items.
+            # However, if `checked` implies children are also returned by sac.tree, this explicit recursion might be redundant.
+            # For safety, let's ensure we check children if the parent is selected OR if we need to find explicitly selected children.
+            # The current logic: if a node (file/dir) is in selected_node_ids, process it.
+            # Then, regardless, recurse for its children to find other selected items.
+            # This seems slightly off. Let's refine:
+            # 1. Create a set of selected_node_ids for quick lookup.
+            # 2. Traverse the *entire* tree.
+            # 3. If a node is a file and its ID is in selected_node_ids, add its path.
+            # 4. If a node is a directory and its ID is in selected_node_ids, add all files in its subtree.
+            # 5. If a node (dir) is NOT in selected_node_ids, still recurse into its children to find selected items deeper in the tree.
+
+    # Refined traversal logic:
+    selected_ids_set = set(selected_node_ids)
+
+    def collect_all_files_from_subtree(nodes_subtree):
+        # Helper to add all files from a given list of nodes (typically children of a selected folder)
+        for sub_node in nodes_subtree:
+            if sub_node['icon'] == 'file-text':
+                files_to_fetch.add(sub_node['path'])
+            elif sub_node['icon'] == 'folder' and sub_node.get('children'):
+                collect_all_files_from_subtree(sub_node['children'])
+
+    def find_selected_recursive(nodes_current_level):
+        for node in nodes_current_level:
+            node_id = node['id']
+            node_path = node['path']
+            is_selected = node_id in selected_ids_set
+
+            if node['icon'] == 'file-text':
+                if is_selected:
+                    files_to_fetch.add(node_path)
+            elif node['icon'] == 'folder':
+                if is_selected: # If folder is selected, grab all files under it
+                    collect_all_files_from_subtree(node.get('children', []))
+                else: # If folder is not selected, still need to check its children
+                    find_selected_recursive(node.get('children', []))
+
+    find_selected_recursive(tree_nodes_data)
+    return list(files_to_fetch)
+
+def generate_repo_map(tree_nodes_data, selected_node_ids):
+    """
+    Generates a string representation of the repository map, showing only selected items
+    and their necessary parent directories.
+    - tree_nodes_data: The SAC tree data (list of nodes).
+    - selected_node_ids: A list or set of selected node IDs.
+    """
+    map_lines = []
+    selected_set = set(selected_node_ids)
+
+    def build_map_recursive(nodes, indent_level, parent_selected=False):
+        for i, node in enumerate(nodes):
+            is_last_child = (i == len(nodes) - 1)
+            prefix = "    " * indent_level
+            connector = "└── " if is_last_child else "├── "
+
+            node_id = node['id']
+            node_label = node['label']
+            node_is_selected = node_id in selected_set
+            node_has_selected_descendant = any(sid.startswith(node_id) and sid != node_id for sid in selected_set if node['type'] == 'dir') # A bit simplistic if IDs are not path-like
+
+            # More robust check for selected descendants by searching the subtree
+            # This is important if node IDs are not hierarchical by string prefix.
+            # For now, we assume our selected_ids are SHAs or full paths used as keys.
+            # The key thing is to know if ANY child path is selected.
+
+            # We need to check if this node OR any of its children are selected to decide to print it.
+            # Let's refine `node_has_selected_descendant`
+
+            def has_selected_descendant_in_subtree(subtree_nodes):
+                for sub_node in subtree_nodes:
+                    if sub_node['id'] in selected_set:
+                        return True
+                    if sub_node.get('children') and has_selected_descendant_in_subtree(sub_node['children']):
+                        return True
+                return False
+
+            if node.get('children'): # It's a directory
+                node_has_selected_descendant = has_selected_descendant_in_subtree(node['children'])
+            else: # It's a file
+                node_has_selected_descendant = False
+
+
+            if node_is_selected or node_has_selected_descendant:
+                map_lines.append(f"{prefix}{connector}{node_label}{'/' if node.get('children') else ''}")
+                if node.get('children'):
+                    build_map_recursive(node['children'], indent_level + 1, node_is_selected or parent_selected)
+
+    build_map_recursive(tree_nodes_data, 0)
+    return "\n".join(map_lines)
+
+
+def build_file_tree_from_paths(paths_list):
+    """
+    Constructs a hierarchical tree data structure from a flat list of path dictionaries.
+    Each path dictionary should have 'path', 'type', 'name', and 'sha'.
+    """
+    tree = []
+    # Use a dictionary to keep track of nodes and their children for easy access
+    # The root node's children will be the actual top-level items of the tree.
+    # Format for sac.tree: list of dicts with 'label', 'id', 'children', 'icon' (optional)
+    # Our internal format: 'title', 'key', 'type', 'path', 'children'
+
+    # Helper to convert our node format to sac.tree format
+    def convert_to_sac_node_format(node_list):
+        sac_nodes = []
+        for node in node_list:
+            sac_node = {
+                "label": node['title'],
+                "id": node['key'], # 'key' is already unique (SHA or path)
+                "icon": 'folder' if node['type'] == 'dir' else 'file-text', # Simple icons
+                "path": node['path'] # Keep path for easy reference if needed
+            }
+            if node.get('children'): # If it's a directory with children
+                sac_node['children'] = convert_to_sac_node_format(node['children'])
+            sac_nodes.append(sac_node)
+        return sac_nodes
+
+    # Temporary map to build the hierarchy. We'll convert it at the end.
+    temp_nodes_map = {"": {"title": "<root>", "key": "", "type": "dir", "path": "", "children": []}}
+
+
+    # Sort paths to ensure parent directories are processed before their children
+    # This might not be strictly necessary if paths are already somewhat ordered or parents are created on demand.
+    # However, sorting by path length or by path string can help.
+    paths_list.sort(key=lambda x: x['path'])
+
+    for item in paths_list:
+        path = item['path']
+        name = item['name']
+        item_type = item['type']
+        item_sha = item.get('sha', path) # Use SHA if available, else path as key for uniqueness
+
+        # Find the parent node in our temporary map
+        parent_path = "/".join(path.split("/")[:-1])
+        parent_node_in_temp_map = temp_nodes_map.get(parent_path)
+
+        # If parent doesn't exist, create it (can happen if paths are not perfectly ordered or structure is sparse)
+        # This part might need to be more robust, creating intermediate parent stubs if necessary.
+        # For simplicity, we assume GitHub API gives us items in a way that parent dirs are implicitly defined
+        # or can be inferred correctly by iterating and creating nodes.
+        # A more robust approach would be to create all parent directory nodes explicitly if not found.
+
+        current_node_internal_format = {
+            "title": name,
+            "key": item_sha,
+            "type": item_type,
+            "path": path,
+        }
+
+        if item_type == "dir":
+            current_node_internal_format["children"] = []
+            # Add this new directory node to our temporary map so it can become a parent itself
+            temp_nodes_map[path] = current_node_internal_format
+
+        if parent_node_in_temp_map:
+            parent_node_in_temp_map["children"].append(current_node_internal_format)
+        else:
+            if parent_path == "": # Top-level item
+                 temp_nodes_map[""]["children"].append(current_node_internal_format)
+            else:
+                # This logic remains similar: handle cases where parent might be missing due to filtering or API issues
+                st.warning(f"Parent node for '{path}' (parent: '{parent_path}') not found in temp_map. Item may be skipped or added to root if logic allows.")
+                # Fallback or more robust parent creation could be added here if needed.
+                # For now, strict parent existence (or being a root item) is enforced.
+
+    # Convert the constructed tree (from temp_nodes_map root's children) to sac.tree format
+    final_sac_tree = convert_to_sac_node_format(temp_nodes_map[""]["children"])
+    return final_sac_tree
+
+
+# Function to fetch content for selected files
+def fetch_content_for_selected_files(selected_file_paths, all_paths_metadata, headers, max_kb):
+    """
+    Fetches content for a list of selected file paths.
+    - selected_file_paths: List of unique file paths (strings) from repo root.
+    - all_paths_metadata: The flat list of dicts (from _fetch_repo_paths_recursive)
+                          containing metadata like 'path', 'download_url', 'size'.
+    - headers: Headers for API requests (including PAT if any).
+    - max_kb: Max file size in KB.
+    """
+    repo_files_content = {}
+
+    # Create a quick lookup map for metadata from the flat list
+    metadata_map = {item['path']: item for item in all_paths_metadata}
+
+    for file_path in selected_file_paths:
+        item_metadata = metadata_map.get(file_path)
+
+        if not item_metadata:
+            st.warning(f"Metadata for '{file_path}' not found. Skipping.")
+            continue
+
+        if item_metadata['type'] != 'file': # Should not happen if get_effective_selected_files works correctly
+            st.warning(f"'{file_path}' is not a file. Skipping content fetch.")
+            continue
+
+        # Max File Size Check
+        file_size_bytes = item_metadata.get('size', 0)
+        if max_kb > 0 and file_size_bytes > (max_kb * 1024):
+            st.warning(f"Skipping '{file_path}' (size: {file_size_bytes / 1024:.2f} KB) as it exceeds the {max_kb} KB limit for download.")
+            continue
+
+        download_url = item_metadata.get('download_url')
+        if not download_url: # Should have been populated by path fetcher
+            st.warning(f"No download_url for file '{file_path}'. Skipping.")
+            continue
+
+        try:
+            st.info(f"Fetching content for: {file_path}")
+            file_response = cached_requests_get(download_url, headers) # Assuming headers are correctly passed
+            # Try decoding with UTF-8, then latin-1
+            try:
+                content = file_response.content.decode('utf-8')
+            except UnicodeDecodeError:
+                try:
+                    content = file_response.content.decode('latin-1')
+                except UnicodeDecodeError:
+                    st.warning(f"Could not decode file {file_path} with UTF-8 or Latin-1. Skipping.")
+                    continue
+            repo_files_content[file_path] = content
+            st.success(f"Fetched and decoded: {file_path}")
+        except requests.exceptions.RequestException as e_file:
+            st.warning(f"Error downloading file {file_path}: {e_file}. Skipping.")
+        except Exception as e_gen: # Catch any other unexpected error during fetch/decode
+             st.error(f"Unexpected error processing file {file_path}: {e_gen}. Skipping.")
 
     return repo_files_content
 
@@ -336,11 +631,136 @@ if st.sidebar.button("Convert to Markdown", key="convert_button"):
         st.error("Invalid GitHub repository URL format. Expected: https://github.com/owner/repo")
         st.stop()
 
-    contents = fetch_repo_contents(repo_url)
+    # --- Step 1: Fetch all paths ---
+    # Note: fetch_repo_contents has been refactored to _fetch_all_repo_paths
+    # and the main function fetch_repo_contents now primarily calls the path fetching
+    # and will later be modified to handle content fetching based on tree selection.
 
-    if contents:
+    # For clarity, let's assume fetch_repo_contents is now the function that fetches paths
+    # This is a bit of a misnomer now, it should be renamed to e.g. fetch_repo_paths_and_build_tree
+    # For now, it returns the flat list of paths as per the refactoring.
+    all_paths_list = fetch_repo_contents(repo_url) # This now returns list of path dicts
+
+    if not all_paths_list:
+        st.warning("No paths were fetched. Cannot build file tree or Markdown.")
+        st.stop()
+
+    # --- Step 2: Build File Tree Data Structure ---
+    st.session_state['repo_file_paths'] = all_paths_list  # Store flat list as well
+
+    if all_paths_list:
+        st.info(f"Total paths fetched: {len(all_paths_list)}. Now building file tree...")
+        # build_file_tree_from_paths now returns sac.tree compatible format
+        repo_tree_for_sac = build_file_tree_from_paths(all_paths_list)
+        st.session_state['repo_file_tree_sac_format'] = repo_tree_for_sac # Store the sac-compatible tree
+
+        if 'repo_file_tree_sac_format' in st.session_state and st.session_state['repo_file_tree_sac_format']:
+            st.subheader("Select Files and Folders to Include:")
+
+            # --- Initial Selection State ---
+            # Pre-select all items initially. Keys are 'id' in sac_format tree.
+            def get_all_keys(nodes):
+                keys = []
+                for node in nodes:
+                    keys.append(node['id'])
+                    if node.get('children'):
+                        keys.extend(get_all_keys(node['children']))
+                return keys
+
+            all_node_keys = get_all_keys(st.session_state['repo_file_tree_sac_format'])
+            # If 'selected_tree_nodes' is not in session_state, initialize with all keys.
+            # Otherwise, respect existing selections (e.g., if user unselected some).
+            if 'selected_tree_nodes' not in st.session_state:
+                 st.session_state.selected_tree_nodes = all_node_keys
+
+            if sac: # Check if streamlit_antd_components was imported successfully
+                try:
+                    selected_keys = sac.tree(
+                        items=st.session_state['repo_file_tree_sac_format'],
+                        checkbox=True,
+                        show_line=True,
+                        height=400, # Adjust height as needed
+                        return_checked=True, # Ensure it returns only checked items' keys
+                        checked=st.session_state.selected_tree_nodes # Pass current selections
+                    )
+                    st.session_state.selected_tree_nodes = selected_keys
+                    st.info(f"Selected items: {len(selected_keys)} (Keys: {selected_keys[:10]}...)") # Show some selected keys
+                except Exception as e:
+                    st.error(f"Error displaying sac.tree: {e}. Falling back to basic display if possible.")
+                    # Here you could implement the fallback st.checkbox tree if sac.tree fails at runtime
+                    # For now, just show an error. The subtask mentions fallback if it cannot be installed.
+                    # If it's installed but fails at runtime, that's a different scenario.
+                    # Fallback logic is not implemented in this step for runtime failure.
+            else:
+                st.warning("streamlit-antd-components (sac) is not available. File tree selection is disabled.")
+                # Basic fallback display (not interactive selection for this step, just showing structure)
+                def display_basic_tree(nodes, indent=0):
+                    for node in nodes:
+                        prefix = "    " * indent
+                        icon = "📁" if node.get('children') else "📄"
+                        st.text(f"{prefix}{icon} {node['label']}")
+                        if node.get('children'):
+                            display_basic_tree(node['children'], indent + 1)
+                if 'repo_file_tree_sac_format' in st.session_state:
+                    display_basic_tree(st.session_state['repo_file_tree_sac_format'])
+
+        else:
+            st.info("File tree could not be generated or is empty.")
+    else:
+        st.info("No paths available to build the tree.")
+
+    # --- Step 3: Fetch content for selected files and generate Markdown ---
+
+    contents_to_convert_to_markdown = {}
+    if 'selected_tree_nodes' in st.session_state and st.session_state.selected_tree_nodes and \
+       'repo_file_tree_sac_format' in st.session_state and 'repo_file_paths' in st.session_state:
+
+        effective_files_to_fetch = get_effective_selected_files(
+            st.session_state.repo_file_tree_sac_format,
+            st.session_state.selected_tree_nodes
+        )
+        st.info(f"Effective files selected for download: {len(effective_files_to_fetch)}")
+        # st.write("Files to fetch:", effective_files_to_fetch) # Debugging
+
+        if effective_files_to_fetch:
+            # Need headers for fetch_content_for_selected_files
+            current_headers = {"Accept": "application/vnd.github.v3.raw"} # Or application/octet-stream
+            if github_pat:
+                current_headers["Authorization"] = f"token {github_pat}"
+
+            contents_to_convert_to_markdown = fetch_content_for_selected_files(
+                effective_files_to_fetch,
+                st.session_state.repo_file_paths, # Pass the flat list with all metadata
+                current_headers,
+                max_file_size_kb # User's preference for max file size
+            )
+        else:
+            st.info("No files are effectively selected to fetch content for Markdown.")
+    else:
+        st.info("No selections made in the tree, or tree data not available.")
+
+
+    if contents_to_convert_to_markdown:
         markdown_output = f"# Repository: {repo_url}\n\n"
-        total_files = len(contents)
+
+        # --- Add Repository Map if option is selected ---
+        if st.session_state.get("repo_map_option", False) and 'repo_file_tree_sac_format' in st.session_state:
+            if st.session_state.selected_tree_nodes: # Ensure there are selections
+                st.info("Generating repository map...")
+                repo_map_str = generate_repo_map(
+                    st.session_state.repo_file_tree_sac_format,
+                    st.session_state.selected_tree_nodes
+                )
+                if repo_map_str:
+                    markdown_output += "## Repository Map\n```\n"
+                    markdown_output += repo_map_str
+                    markdown_output += "\n```\n\n---\n\n"
+                else:
+                    st.info("Map generated but was empty (no selected items to show in map).")
+            else:
+                st.info("No items selected in the tree, skipping repository map.")
+
+        total_files = len(contents_to_convert_to_markdown)
         st.info(f"Formatting {total_files} file(s) into Markdown...")
 
         # Define priority files (lowercase for case-insensitive comparison)
@@ -410,7 +830,9 @@ if st.sidebar.button("Convert to Markdown", key="convert_button"):
             file_name=download_filename,
             mime="text/markdown",
         )
-    elif get_repo_api_url(repo_url): # If URL was valid but contents is empty (and not due to invalid URL)
-        st.warning("No processable files were found in the repository, or all files were filtered out by the current settings.")
-    else:
-        st.error("Please enter a GitHub repository URL.")
+    # elif get_repo_api_url(repo_url) and not contents_to_convert_to_markdown: # If URL valid but no content to convert
+    #    st.info("No files selected or processed for Markdown conversion yet. Select files from the tree (once implemented).")
+    elif not all_paths_list and get_repo_api_url(repo_url): # If paths list is empty but URL was valid
+         st.warning("No processable files or directories were found in the repository based on current filters.")
+    # else: # This case should be caught by initial repo_url check
+    #    st.error("Please enter a GitHub repository URL.")
